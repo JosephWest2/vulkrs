@@ -1,0 +1,11 @@
+[package]
+name = "vulkrs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.93"
+nalgebra = "0.33.2"
+vulkano = "0.34.1"
+vulkano-shaders = "0.34.0"
+winit = { version = "0.30.5", features = ["rwh_05"] }
