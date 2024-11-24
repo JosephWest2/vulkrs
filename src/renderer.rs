@@ -1,19 +1,16 @@
 use std::sync::Arc;
 
 use vulkano::{
-    buffer::{BufferContents, Subbuffer},
-    command_buffer::{
+    buffer::{Buffer, BufferContents, BufferCreateFlags, BufferCreateInfo, BufferUsage, Subbuffer}, command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
-        RenderPassBeginInfo, SubpassBeginInfo, SubpassContents,
-    },
-    device::{
-        physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, Queue,
-        QueueCreateInfo, QueueFlags,
-    },
-    image::{view::ImageView, Image, ImageUsage},
-    instance::{Instance, InstanceCreateInfo},
-    memory::allocator::{FreeListAllocator, GenericMemoryAllocator, StandardMemoryAllocator},
-    pipeline::{
+        CopyBufferInfoTyped, PrimaryCommandBufferAbstract, RenderPassBeginInfo, SubpassBeginInfo,
+        SubpassContents,
+    }, device::{
+        physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, DeviceOwned,
+        Queue, QueueCreateInfo, QueueFlags,
+    }, image::{view::ImageView, Image, ImageUsage}, instance::{Instance, InstanceCreateInfo}, memory::allocator::{
+        AllocationCreateInfo, DeviceLayout, FreeListAllocator, GenericMemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator
+    }, pipeline::{
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             input_assembly::InputAssemblyState,
@@ -25,17 +22,15 @@ use vulkano::{
         },
         layout::PipelineDescriptorSetLayoutCreateInfo,
         DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
-    },
-    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
-    swapchain::{
+    }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, swapchain::{
         acquire_next_image, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
-    },
-    sync::GpuFuture,
-    Validated, VulkanError, VulkanLibrary,
+    }, sync::GpuFuture, DeviceSize, Validated, VulkanError, VulkanLibrary
 };
 use winit::{event_loop::ActiveEventLoop, window::Window};
 
-#[derive(BufferContents, Vertex)]
+use crate::camera::Camera;
+
+#[derive(BufferContents, Vertex, Clone)]
 #[repr(C)]
 pub struct TriangleVertex {
     #[format(R32G32B32_SFLOAT)]
@@ -45,7 +40,7 @@ pub struct TriangleVertex {
 pub struct Renderer {
     pub window: Arc<Window>,
     pub resize_and_rebuild_swapchain_requested: bool,
-    pub memory_allocator: Arc<GenericMemoryAllocator<FreeListAllocator>>,
+    memory_allocator: Arc<GenericMemoryAllocator<FreeListAllocator>>,
     instance: Arc<Instance>,
     device: Arc<Device>,
     queue: Arc<Queue>,
@@ -56,6 +51,8 @@ pub struct Renderer {
     framebuffers: Vec<Arc<Framebuffer>>,
     previous_frame_end: Option<Box<dyn GpuFuture>>,
     viewport: Viewport,
+    vertex_buffer: Subbuffer<[TriangleVertex]>,
+    index_buffer: Subbuffer<[u32]>,
 }
 
 impl Renderer {
@@ -202,6 +199,34 @@ impl Renderer {
         )
         .unwrap();
 
+        let vertex_buffer = Buffer::new_unsized::<[TriangleVertex]>(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            128
+        )
+        .unwrap();
+
+        let index_buffer = Buffer::new_unsized::<[u32]>(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            128
+        )
+        .unwrap();
+
         let pipeline = {
             let vertex_shader = vertex_shader::load(device.clone())
                 .unwrap()
@@ -272,6 +297,8 @@ impl Renderer {
             framebuffers,
             swapchain,
             viewport,
+            vertex_buffer,
+            index_buffer,
             resize_and_rebuild_swapchain_requested: false,
         }
     }
@@ -309,11 +336,74 @@ impl Renderer {
         self.viewport.extent = self.window.inner_size().into();
     }
 
-    pub fn perform_render_pass(
-        &mut self,
-        vertex_buffer: Subbuffer<[TriangleVertex]>,
-        index_buffer: Subbuffer<[u32]>,
-    ) {
+    pub fn update_vertices(&self, vertices: &Vec<TriangleVertex>, indices: &Vec<u32>) {
+        if indices.len() * std::mem::size_of::<u32>() > self.index_buffer.size() as usize {
+            eprintln!("INDEX BUFFER SMALLER THAN INDEX INPUT");
+        }
+        if vertices.len() * std::mem::size_of::<TriangleVertex>() > self.vertex_buffer.size() as usize {
+            eprintln!("VERTEX BUFFER SMALLER THAN VERTEX INPUT");
+        }
+        let staging_vertex_buffer = Buffer::from_iter(
+            self.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            vertices.to_vec(),
+        )
+        .unwrap();
+        let staging_index_buffer = Buffer::from_iter(
+            self.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            indices.to_vec(),
+        )
+        .unwrap();
+
+        let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
+            &self.command_buffer_allocator,
+            self.queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+
+        command_buffer_builder
+            .copy_buffer(CopyBufferInfoTyped::buffers(
+                staging_vertex_buffer,
+                self.vertex_buffer.clone(),
+            ))
+            .unwrap()
+            .copy_buffer(CopyBufferInfoTyped::buffers(
+                staging_index_buffer,
+                self.index_buffer.clone(),
+            ))
+            .unwrap();
+
+        let command_buffer = command_buffer_builder.build().unwrap();
+
+        //BLOCKS!
+        command_buffer
+            .execute(self.queue.clone())
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None)
+            .unwrap();
+    }
+
+    pub fn perform_render_pass(&mut self, camera: &Camera) {
         let window_size = self.window.inner_size();
         if window_size.width < 1 || window_size.height < 1 {
             return;
@@ -337,7 +427,7 @@ impl Renderer {
                 Err(e) => panic!("Failed to aquire next image from swapchain: {e}"),
             };
 
-        let mut builder = AutoCommandBufferBuilder::primary(
+        let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
             &self.command_buffer_allocator,
             self.queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
@@ -348,7 +438,7 @@ impl Renderer {
             self.resize_and_rebuild_swapchain_requested = true;
         }
 
-        builder
+        command_buffer_builder
             .begin_render_pass(
                 RenderPassBeginInfo {
                     clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into())],
@@ -366,18 +456,20 @@ impl Renderer {
             .unwrap()
             .bind_pipeline_graphics(self.pipeline.clone())
             .unwrap()
-            .bind_vertex_buffers(0, vertex_buffer.clone())
+            .bind_vertex_buffers(0, self.vertex_buffer.clone())
             .unwrap()
-            .bind_index_buffer(index_buffer.clone())
+            .bind_index_buffer(self.index_buffer.clone())
             .unwrap();
 
-        builder
-            .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)
+        command_buffer_builder
+            .draw_indexed(self.index_buffer.len() as u32, 1, 0, 0, 0)
             .unwrap();
 
-        builder.end_render_pass(Default::default()).unwrap();
+        command_buffer_builder
+            .end_render_pass(Default::default())
+            .unwrap();
 
-        let command_buffer = builder.build().unwrap();
+        let command_buffer = command_buffer_builder.build().unwrap();
 
         let future = self
             .previous_frame_end
