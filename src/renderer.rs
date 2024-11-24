@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use vulkano::{
-    buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
+    buffer::{BufferContents, Subbuffer},
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
         RenderPassBeginInfo, SubpassBeginInfo, SubpassContents,
@@ -12,7 +12,7 @@ use vulkano::{
     },
     image::{view::ImageView, Image, ImageUsage},
     instance::{Instance, InstanceCreateInfo},
-    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
+    memory::allocator::{FreeListAllocator, GenericMemoryAllocator, StandardMemoryAllocator},
     pipeline::{
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
@@ -38,18 +38,18 @@ use winit::{event_loop::ActiveEventLoop, window::Window};
 #[derive(BufferContents, Vertex)]
 #[repr(C)]
 pub struct TriangleVertex {
-    #[format(R32G32_SFLOAT)]
-    position: [f32; 2],
+    #[format(R32G32B32_SFLOAT)]
+    pub position: [f32; 3],
 }
 
 pub struct Renderer {
     pub window: Arc<Window>,
-    pub resize_requested: bool,
+    pub resize_and_rebuild_swapchain_requested: bool,
+    pub memory_allocator: Arc<GenericMemoryAllocator<FreeListAllocator>>,
     instance: Arc<Instance>,
     device: Arc<Device>,
     queue: Arc<Queue>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-    vertex_buffer: Subbuffer<[TriangleVertex]>,
     pipeline: Arc<GraphicsPipeline>,
     swapchain: Arc<Swapchain>,
     render_pass: Arc<RenderPass>,
@@ -141,32 +141,6 @@ impl Renderer {
             device.clone(),
             Default::default(),
         ));
-
-        let vertices = [
-            TriangleVertex {
-                position: [-0.5, -0.25],
-            },
-            TriangleVertex {
-                position: [0.0, 0.5],
-            },
-            TriangleVertex {
-                position: [0.25, -0.1],
-            },
-        ];
-        let vertex_buffer = Buffer::from_iter(
-            memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::VERTEX_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            vertices,
-        )
-        .unwrap();
 
         let (swapchain, images) = {
             let surface_capabilities = device
@@ -290,15 +264,15 @@ impl Renderer {
             instance,
             device,
             queue,
+            memory_allocator,
             command_buffer_allocator,
-            vertex_buffer,
             pipeline,
             render_pass,
             previous_frame_end,
             framebuffers,
             swapchain,
             viewport,
-            resize_requested: false,
+            resize_and_rebuild_swapchain_requested: false,
         }
     }
 
@@ -322,7 +296,7 @@ impl Renderer {
             .collect::<Vec<_>>()
     }
 
-    fn resize(&mut self) {
+    fn resize_and_rebuild_swapchain(&mut self) {
         let (new_swapchain, new_images) = self
             .swapchain
             .recreate(SwapchainCreateInfo {
@@ -335,7 +309,11 @@ impl Renderer {
         self.viewport.extent = self.window.inner_size().into();
     }
 
-    pub fn perform_render_pass(&mut self) {
+    pub fn perform_render_pass(
+        &mut self,
+        vertex_buffer: Subbuffer<[TriangleVertex]>,
+        index_buffer: Subbuffer<[u32]>,
+    ) {
         let window_size = self.window.inner_size();
         if window_size.width < 1 || window_size.height < 1 {
             return;
@@ -343,9 +321,9 @@ impl Renderer {
 
         self.previous_frame_end.as_mut().unwrap().cleanup_finished();
 
-        if self.resize_requested {
-            self.resize();
-            self.resize_requested = false;
+        if self.resize_and_rebuild_swapchain_requested {
+            self.resize_and_rebuild_swapchain();
+            self.resize_and_rebuild_swapchain_requested = false;
         }
 
         //This call blocks if there is no available image from the swapchain!
@@ -353,7 +331,7 @@ impl Renderer {
             match acquire_next_image(self.swapchain.clone(), None).map_err(Validated::unwrap) {
                 Ok(r) => r,
                 Err(VulkanError::OutOfDate) => {
-                    self.resize_requested = true;
+                    self.resize_and_rebuild_swapchain_requested = true;
                     return;
                 }
                 Err(e) => panic!("Failed to aquire next image from swapchain: {e}"),
@@ -365,6 +343,10 @@ impl Renderer {
             CommandBufferUsage::OneTimeSubmit,
         )
         .unwrap();
+
+        if suboptimal {
+            self.resize_and_rebuild_swapchain_requested = true;
+        }
 
         builder
             .begin_render_pass(
@@ -384,10 +366,14 @@ impl Renderer {
             .unwrap()
             .bind_pipeline_graphics(self.pipeline.clone())
             .unwrap()
-            .bind_vertex_buffers(0, self.vertex_buffer.clone())
+            .bind_vertex_buffers(0, vertex_buffer.clone())
+            .unwrap()
+            .bind_index_buffer(index_buffer.clone())
             .unwrap();
 
-        unsafe { builder.draw(self.vertex_buffer.len() as u32, 1, 0, 0) }.unwrap();
+        builder
+            .draw_indexed(index_buffer.len() as u32, 1, 0, 0, 0)
+            .unwrap();
 
         builder.end_render_pass(Default::default()).unwrap();
 
@@ -411,13 +397,12 @@ impl Renderer {
                 self.previous_frame_end = Some(future.boxed());
             }
             Err(VulkanError::OutOfDate) => {
-                self.resize_requested = true;
+                self.resize_and_rebuild_swapchain_requested = true;
                 self.previous_frame_end = Some(vulkano::sync::now(self.device.clone()).boxed());
             }
             Err(e) => {
                 panic!("Failed to flush future: {e}");
             }
-            _ => (),
         }
     }
 }
