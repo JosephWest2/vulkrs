@@ -55,6 +55,11 @@ impl Camera {
         );
         return projection.as_matrix() * view_matrix;
     }
+    pub fn get_uniform(&self) -> CameraUniform {
+        CameraUniform {
+            view_projection_matrix: self.get_view_projection_matrix().into(),
+        }
+    }
 }
 
 pub struct CameraController {

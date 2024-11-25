@@ -1,15 +1,19 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use vulkano::{
-    buffer::{Buffer, BufferContents, BufferCreateFlags, BufferCreateInfo, BufferUsage, Subbuffer}, command_buffer::{
+    buffer::{
+        allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
+        Buffer, BufferContents, BufferCreateFlags, BufferCreateInfo, BufferUsage, Subbuffer,
+    }, command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
         CopyBufferInfoTyped, PrimaryCommandBufferAbstract, RenderPassBeginInfo, SubpassBeginInfo,
         SubpassContents,
-    }, device::{
+    }, descriptor_set::{allocator::StandardDescriptorSetAllocator, layout::{DescriptorSetLayoutBinding, DescriptorSetLayoutCreateFlags, DescriptorSetLayoutCreateInfo}, DescriptorSet, WriteDescriptorSet}, device::{
         physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, DeviceOwned,
         Queue, QueueCreateInfo, QueueFlags,
     }, image::{view::ImageView, Image, ImageUsage}, instance::{Instance, InstanceCreateInfo}, memory::allocator::{
-        AllocationCreateInfo, DeviceLayout, FreeListAllocator, GenericMemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator
+        AllocationCreateInfo, DeviceLayout, FreeListAllocator, GenericMemoryAllocator,
+        MemoryTypeFilter, StandardMemoryAllocator,
     }, pipeline::{
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
@@ -19,10 +23,8 @@ use vulkano::{
             vertex_input::{Vertex, VertexDefinition},
             viewport::{Viewport, ViewportState},
             GraphicsPipelineCreateInfo,
-        },
-        layout::PipelineDescriptorSetLayoutCreateInfo,
-        DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
-    }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, swapchain::{
+        }, layout::{PipelineDescriptorSetLayoutCreateInfo, PipelineLayoutCreateFlags, PipelineLayoutCreateInfo}, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo
+    }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, shader::DescriptorBindingRequirements, swapchain::{
         acquire_next_image, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
     }, sync::GpuFuture, DeviceSize, Validated, VulkanError, VulkanLibrary
 };
@@ -45,6 +47,7 @@ pub struct Renderer {
     device: Arc<Device>,
     queue: Arc<Queue>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     pipeline: Arc<GraphicsPipeline>,
     swapchain: Arc<Swapchain>,
     render_pass: Arc<RenderPass>,
@@ -53,6 +56,7 @@ pub struct Renderer {
     viewport: Viewport,
     vertex_buffer: Subbuffer<[TriangleVertex]>,
     index_buffer: Subbuffer<[u32]>,
+    uniform_buffer_allocator: SubbufferAllocator,
 }
 
 impl Renderer {
@@ -138,6 +142,11 @@ impl Renderer {
             device.clone(),
             Default::default(),
         ));
+        let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
+                device.clone(),
+                Default::default(),
+        ));
+                
 
         let (swapchain, images) = {
             let surface_capabilities = device
@@ -209,7 +218,7 @@ impl Renderer {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             },
-            128
+            128,
         )
         .unwrap();
 
@@ -223,9 +232,19 @@ impl Renderer {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             },
-            128
+            128,
         )
         .unwrap();
+
+        let uniform_buffer_allocator = SubbufferAllocator::new(
+            memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: BufferUsage::UNIFORM_BUFFER,
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+        );
 
         let pipeline = {
             let vertex_shader = vertex_shader::load(device.clone())
@@ -243,11 +262,19 @@ impl Renderer {
                 PipelineShaderStageCreateInfo::new(vertex_shader),
                 PipelineShaderStageCreateInfo::new(fragment_shader),
             ];
+            let camera_layout_bindings = BTreeMap::from([
+                (0, DescriptorSetLayoutBinding::from(DescriptorBindingRequirements::))
+            ]);
+            let camera_descriptor_info = DescriptorSetLayoutCreateInfo {
+                ..Default::default()
+            };
             let layout = PipelineLayout::new(
                 device.clone(),
-                PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                    .into_pipeline_layout_create_info(device.clone())
-                    .unwrap(),
+                PipelineLayoutCreateInfo {
+
+
+                    ..Default::default()
+                }
             )
             .unwrap();
             let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
@@ -261,6 +288,7 @@ impl Renderer {
                     input_assembly_state: Some(InputAssemblyState::default()),
                     viewport_state: Some(ViewportState::default()),
                     rasterization_state: Some(RasterizationState::default()),
+                    depth_stencil_state: None,
                     multisample_state: Some(MultisampleState::default()),
                     color_blend_state: Some(ColorBlendState::with_attachment_states(
                         subpass.num_color_attachments(),
@@ -299,6 +327,8 @@ impl Renderer {
             viewport,
             vertex_buffer,
             index_buffer,
+            uniform_buffer_allocator,
+            descriptor_set_allocator,
             resize_and_rebuild_swapchain_requested: false,
         }
     }
@@ -340,7 +370,9 @@ impl Renderer {
         if indices.len() * std::mem::size_of::<u32>() > self.index_buffer.size() as usize {
             eprintln!("INDEX BUFFER SMALLER THAN INDEX INPUT");
         }
-        if vertices.len() * std::mem::size_of::<TriangleVertex>() > self.vertex_buffer.size() as usize {
+        if vertices.len() * std::mem::size_of::<TriangleVertex>()
+            > self.vertex_buffer.size() as usize
+        {
             eprintln!("VERTEX BUFFER SMALLER THAN VERTEX INPUT");
         }
         let staging_vertex_buffer = Buffer::from_iter(
@@ -426,6 +458,9 @@ impl Renderer {
                 }
                 Err(e) => panic!("Failed to aquire next image from swapchain: {e}"),
             };
+
+        let camera_uniform_buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
+        *camera_uniform_buffer.write().unwrap() = camera.get_uniform();
 
         let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
             &self.command_buffer_allocator,
