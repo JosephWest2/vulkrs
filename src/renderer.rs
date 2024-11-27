@@ -4,17 +4,31 @@ use vulkano::{
     buffer::{
         allocator::{SubbufferAllocator, SubbufferAllocatorCreateInfo},
         Buffer, BufferContents, BufferCreateFlags, BufferCreateInfo, BufferUsage, Subbuffer,
-    }, command_buffer::{
+    },
+    command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
         CopyBufferInfoTyped, PrimaryCommandBufferAbstract, RenderPassBeginInfo, SubpassBeginInfo,
         SubpassContents,
-    }, descriptor_set::{allocator::StandardDescriptorSetAllocator, layout::{DescriptorSetLayoutBinding, DescriptorSetLayoutCreateFlags, DescriptorSetLayoutCreateInfo}, DescriptorSet, WriteDescriptorSet}, device::{
+    },
+    descriptor_set::{
+        allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo},
+        layout::{
+            DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateFlags,
+            DescriptorSetLayoutCreateInfo, DescriptorType,
+        },
+        DescriptorBindingResources, DescriptorSet, PersistentDescriptorSet, WriteDescriptorSet,
+    },
+    device::{
         physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, DeviceOwned,
         Queue, QueueCreateInfo, QueueFlags,
-    }, image::{view::ImageView, Image, ImageUsage}, instance::{Instance, InstanceCreateInfo}, memory::allocator::{
+    },
+    image::{view::ImageView, Image, ImageUsage},
+    instance::{Instance, InstanceCreateInfo},
+    memory::allocator::{
         AllocationCreateInfo, DeviceLayout, FreeListAllocator, GenericMemoryAllocator,
         MemoryTypeFilter, StandardMemoryAllocator,
-    }, pipeline::{
+    },
+    pipeline::{
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             input_assembly::InputAssemblyState,
@@ -23,14 +37,25 @@ use vulkano::{
             vertex_input::{Vertex, VertexDefinition},
             viewport::{Viewport, ViewportState},
             GraphicsPipelineCreateInfo,
-        }, layout::{PipelineDescriptorSetLayoutCreateInfo, PipelineLayoutCreateFlags, PipelineLayoutCreateInfo}, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo
-    }, render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass}, shader::DescriptorBindingRequirements, swapchain::{
-        acquire_next_image, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
-    }, sync::GpuFuture, DeviceSize, Validated, VulkanError, VulkanLibrary
+        },
+        layout::{
+            PipelineDescriptorSetLayoutCreateInfo, PipelineLayoutCreateFlags,
+            PipelineLayoutCreateInfo,
+        },
+        DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+        PipelineShaderStageCreateInfo,
+    },
+    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
+    shader::DescriptorBindingRequirements,
+    swapchain::{
+        acquire_next_image, PresentMode, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo
+    },
+    sync::GpuFuture,
+    DeviceSize, Validated, VulkanError, VulkanLibrary,
 };
 use winit::{event_loop::ActiveEventLoop, window::Window};
 
-use crate::camera::Camera;
+use crate::camera::{Camera, CameraUniform};
 
 #[derive(BufferContents, Vertex, Clone)]
 #[repr(C)]
@@ -143,10 +168,9 @@ impl Renderer {
             Default::default(),
         ));
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
-                device.clone(),
-                Default::default(),
+            device.clone(),
+            Default::default(),
         ));
-                
 
         let (swapchain, images) = {
             let surface_capabilities = device
@@ -166,6 +190,7 @@ impl Renderer {
                     image_format,
                     image_extent: window.inner_size().into(),
                     image_usage: ImageUsage::COLOR_ATTACHMENT,
+                    present_mode: PresentMode::Immediate,
                     composite_alpha: surface_capabilities
                         .supported_composite_alpha
                         .into_iter()
@@ -262,19 +287,11 @@ impl Renderer {
                 PipelineShaderStageCreateInfo::new(vertex_shader),
                 PipelineShaderStageCreateInfo::new(fragment_shader),
             ];
-            let camera_layout_bindings = BTreeMap::from([
-                (0, DescriptorSetLayoutBinding::from(DescriptorBindingRequirements::))
-            ]);
-            let camera_descriptor_info = DescriptorSetLayoutCreateInfo {
-                ..Default::default()
-            };
             let layout = PipelineLayout::new(
                 device.clone(),
-                PipelineLayoutCreateInfo {
-
-
-                    ..Default::default()
-                }
+                PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                    .into_pipeline_layout_create_info(device.clone())
+                    .unwrap(),
             )
             .unwrap();
             let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
@@ -301,6 +318,7 @@ impl Renderer {
             )
             .unwrap()
         };
+
 
         let previous_frame_end = Some(vulkano::sync::now(device.clone()).boxed());
 
@@ -459,8 +477,6 @@ impl Renderer {
                 Err(e) => panic!("Failed to aquire next image from swapchain: {e}"),
             };
 
-        let camera_uniform_buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
-        *camera_uniform_buffer.write().unwrap() = camera.get_uniform();
 
         let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
             &self.command_buffer_allocator,
@@ -472,6 +488,18 @@ impl Renderer {
         if suboptimal {
             self.resize_and_rebuild_swapchain_requested = true;
         }
+
+        let camera_uniform_buffer = self.uniform_buffer_allocator
+            .allocate_sized::<CameraUniform>()
+            .unwrap();
+        *camera_uniform_buffer.write().unwrap() = camera.get_uniform();
+        let camera_descriptor_set = PersistentDescriptorSet::new(
+            &self.descriptor_set_allocator,
+            self.pipeline.layout().set_layouts()[0].clone(),
+            [WriteDescriptorSet::buffer(0, camera_uniform_buffer)],
+            [],
+        )
+        .unwrap();
 
         command_buffer_builder
             .begin_render_pass(
@@ -494,6 +522,13 @@ impl Renderer {
             .bind_vertex_buffers(0, self.vertex_buffer.clone())
             .unwrap()
             .bind_index_buffer(self.index_buffer.clone())
+            .unwrap()
+            .bind_descriptor_sets(
+                self.pipeline.bind_point(),
+                self.pipeline.layout().clone(),
+                0,
+                vec![camera_descriptor_set.clone().offsets([])],
+            )
             .unwrap();
 
         command_buffer_builder

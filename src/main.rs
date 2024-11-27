@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use app::App;
 use camera::{Camera, CameraController};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -12,6 +14,7 @@ fn main() {
         renderer: None,
         camera: Camera::new(1920.0/1080.0),
         camera_controller: CameraController::new(),
+        previous_frame: Instant::now(),
     };
     let event_loop = EventLoop::new().expect("Failed to create winit event loop");
     event_loop.set_control_flow(ControlFlow::Poll);

@@ -1,3 +1,5 @@
+use std::time::{self, Instant};
+
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, WindowEvent},
@@ -13,6 +15,7 @@ pub struct App {
     pub renderer: Option<Renderer>,
     pub camera: Camera,
     pub camera_controller: CameraController,
+    pub previous_frame: time::Instant,
 }
 
 const VERTICES: [TriangleVertex; 4] = [
@@ -69,6 +72,9 @@ impl ApplicationHandler for App {
                 let renderer = self.renderer.as_mut().unwrap();
                 renderer.perform_render_pass(&self.camera);
                 renderer.window.request_redraw();
+                let dur = self.previous_frame.elapsed();
+                dbg!("{}", dur);
+                self.previous_frame = Instant::now();
             }
             WindowEvent::KeyboardInput {
                 device_id: _,
